@@ -8,7 +8,7 @@ import tempfile
 import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -187,11 +187,21 @@ class POP3Client:
         subject = self._decode_header(email_message.get('Subject', ''))
         date_str = email_message.get('Date', '')
         
-        # Parse date
+        # Parse date and convert to China timezone (UTC+8)
         try:
             email_date = email.utils.parsedate_to_datetime(date_str)
+            # Convert to China timezone
+            china_tz = timezone(timedelta(hours=8))
+            if email_date.tzinfo is None:
+                # If no timezone info, assume it's already in China timezone
+                email_date = email_date.replace(tzinfo=china_tz)
+            else:
+                # Convert to China timezone
+                email_date = email_date.astimezone(china_tz)
         except Exception:
-            email_date = datetime.now()
+            # Use current time in China timezone as fallback
+            china_tz = timezone(timedelta(hours=8))
+            email_date = datetime.now(china_tz)
         
         # Extract content
         content = self._extract_content(email_message)

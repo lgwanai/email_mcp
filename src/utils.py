@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from dataclasses import asdict
 
@@ -18,8 +18,11 @@ def setup_logging(level: str = "DEBUG") -> None:
     )
 
 
+# 东八区时区对象
+CHINA_TZ = timezone(timedelta(hours=8))
+
 def parse_datetime(date_string: str) -> Optional[datetime]:
-    """Parse datetime string in various formats."""
+    """Parse datetime string in various formats and convert to China timezone (UTC+8)."""
     formats = [
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d",
@@ -35,7 +38,14 @@ def parse_datetime(date_string: str) -> Optional[datetime]:
     
     for fmt in formats:
         try:
-            return datetime.strptime(date_string, fmt)
+            dt = datetime.strptime(date_string, fmt)
+            # 如果解析的日期没有时区信息，假设为东八区时间
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=CHINA_TZ)
+            else:
+                # 如果有时区信息，转换为东八区时间
+                dt = dt.astimezone(CHINA_TZ)
+            return dt
         except ValueError:
             continue
     
@@ -211,7 +221,7 @@ def format_email_response(emails: List[Any]) -> Dict[str, Any]:
         "status": "success",
         "total_emails": len(formatted_emails),
         "emails": formatted_emails,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(CHINA_TZ).isoformat()
     }
 
 
@@ -224,7 +234,7 @@ def format_error_response(error: Exception, request_id: Optional[str] = None) ->
         "status": "error",
         "error_type": error_type,
         "error_message": error_message,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(CHINA_TZ).isoformat()
     }
     
     if request_id:
@@ -265,7 +275,7 @@ def create_success_response(data: Any, message: str = "Operation completed succe
         "status": "success",
         "message": message,
         "data": data,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(CHINA_TZ).isoformat()
     }
 
 
