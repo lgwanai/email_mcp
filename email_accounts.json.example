@@ -1,0 +1,65 @@
+{
+  "accounts": {
+    "user@gmail.com": {
+      "email_address": "user@gmail.com",
+      "password": "your_app_password_here",
+      "display_name": "Personal Gmail",
+      "protocol": "imap",
+      "imap_host": "imap.gmail.com",
+      "imap_port": 993,
+      "imap_use_ssl": true,
+      "pop3_host": "pop.gmail.com",
+      "pop3_port": 995,
+      "pop3_use_ssl": true,
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 587,
+      "smtp_use_tls": true,
+      "enabled": true,
+      "default_folder": "INBOX"
+    },
+    "work@company.com": {
+      "email_address": "work@company.com",
+      "password": "your_work_password_here",
+      "display_name": "Work Email",
+      "protocol": "imap",
+      "imap_host": "imap.company.com",
+      "imap_port": 993,
+      "imap_use_ssl": true,
+      "pop3_host": "pop.company.com",
+      "pop3_port": 995,
+      "pop3_use_ssl": true,
+      "smtp_host": "smtp.company.com",
+      "smtp_port": 587,
+      "smtp_use_tls": true,
+      "enabled": true,
+      "default_folder": "INBOX"
+    },
+    "personal@outlook.com": {
+      "email_address": "personal@outlook.com",
+      "password": "your_outlook_password_here",
+      "display_name": "Personal Outlook",
+      "protocol": "pop3",
+      "imap_host": "outlook.office365.com",
+      "imap_port": 993,
+      "imap_use_ssl": true,
+      "pop3_host": "outlook.office365.com",
+      "pop3_port": 995,
+      "pop3_use_ssl": true,
+      "smtp_host": "smtp.office365.com",
+      "smtp_port": 587,
+      "smtp_use_tls": true,
+      "enabled": true,
+      "default_folder": "INBOX"
+    },
+    "sender@gmail.com": {
+      "email_address": "sender@gmail.com",
+      "password": "your_gmail_app_password_here",
+      "display_name": "SMTP Only Sender",
+      "protocol": "smtp",
+      "smtp_host": "smtp.gmail.com",
+      "smtp_port": 587,
+      "smtp_use_tls": true,
+      "enabled": true
+    }
+  }
+}

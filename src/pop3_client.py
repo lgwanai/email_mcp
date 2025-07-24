@@ -1,6 +1,6 @@
-"""Email client implementation for IMAP and SMTP operations."""
+"""POP3 email client implementation."""
 
-import imaplib
+import poplib
 import smtplib
 import email
 import asyncio
@@ -8,13 +8,14 @@ import tempfile
 import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.message import EmailMessage
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header, decode_header
 import logging
 from dataclasses import dataclass
+
 # Try to import markitdown, fallback to None if not available
 try:
     from markitdown import MarkItDown
@@ -27,10 +28,10 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class EmailConfig:
-    """Email server configuration."""
+class POP3Config:
+    """POP3 server configuration."""
     host: str
-    port: int = 993
+    port: int = 995
     use_ssl: bool = True
     username: str = ""
     password: str = ""
@@ -48,12 +49,10 @@ class SMTPConfig:
 
 @dataclass
 class EmailFilter:
-    """Email filtering parameters."""
-    folder: str = "INBOX"
+    """Email filtering parameters for POP3."""
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     limit: int = 10
-    start_uid: Optional[str] = None
     reverse_order: bool = False  # True for descending (newest first), False for ascending (oldest first)
 
 
@@ -72,42 +71,45 @@ class ParsedEmail:
     raw_message: bytes
 
 
-class EmailClient:
-    """Async IMAP and SMTP email client."""
+class POP3Client:
+    """Async POP3 and SMTP email client."""
     
-    def __init__(self, config: EmailConfig, smtp_config: Optional[SMTPConfig] = None):
+    def __init__(self, config: POP3Config, smtp_config: Optional[SMTPConfig] = None):
         self.config = config
         self.smtp_config = smtp_config
-        self._connection: Optional[imaplib.IMAP4_SSL] = None
+        self._connection: Optional[poplib.POP3_SSL] = None
         
     async def connect(self) -> None:
-        """Establish connection to email server."""
+        """Establish connection to POP3 server."""
         try:
             if self.config.use_ssl:
-                self._connection = imaplib.IMAP4_SSL(self.config.host, self.config.port)
+                self._connection = poplib.POP3_SSL(self.config.host, self.config.port)
             else:
-                self._connection = imaplib.IMAP4(self.config.host, self.config.port)
+                self._connection = poplib.POP3(self.config.host, self.config.port)
             
             # Login
             await asyncio.get_event_loop().run_in_executor(
-                None, self._connection.login, self.config.username, self.config.password
+                None, self._connection.user, self.config.username
             )
-            logger.info(f"Connected to {self.config.host} as {self.config.username}")
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._connection.pass_, self.config.password
+            )
+            logger.info(f"Connected to POP3 server {self.config.host} as {self.config.username}")
             
         except Exception as e:
-            logger.error(f"Failed to connect to email server: {e}")
-            raise ConnectionError(f"Email connection failed: {e}")
+            logger.error(f"Failed to connect to POP3 server: {e}")
+            raise ConnectionError(f"POP3 connection failed: {e}")
     
     async def disconnect(self) -> None:
-        """Close connection to email server."""
+        """Close connection to POP3 server."""
         if self._connection:
             try:
                 await asyncio.get_event_loop().run_in_executor(
-                    None, self._connection.logout
+                    None, self._connection.quit
                 )
-                logger.info("Disconnected from email server")
+                logger.info("Disconnected from POP3 server")
             except Exception as e:
-                logger.warning(f"Error during disconnect: {e}")
+                logger.warning(f"Error during POP3 disconnect: {e}")
             finally:
                 self._connection = None
     
@@ -117,91 +119,64 @@ class EmailClient:
             await self.connect()
         
         try:
-            # Select folder
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._connection.select, filter_params.folder
+            # Get message count and total size
+            num_messages, total_size = await asyncio.get_event_loop().run_in_executor(
+                None, self._connection.stat
             )
             
-            # Build search criteria
-            search_criteria = self._build_search_criteria(filter_params)
-            logger.info(f"IMAP search criteria: {search_criteria}")
+            if num_messages == 0:
+                logger.info("No emails found in POP3 mailbox")
+                return []
             
-            # Search for emails
-            typ, message_numbers = await asyncio.get_event_loop().run_in_executor(
-                None, self._connection.search, None, search_criteria
-            )
+            # Get list of message numbers
+            message_numbers = list(range(1, num_messages + 1))
             
-            if typ != 'OK':
-                raise Exception(f"Search failed: {message_numbers}")
-            
-            # Get message UIDs
-            message_ids = message_numbers[0].split()
-            logger.info(f"Found {len(message_ids)} messages matching criteria: {message_ids[:10] if len(message_ids) > 10 else message_ids}")
-            
-            # Apply sorting (reverse order if requested)
+            # Apply sorting (POP3 messages are typically in chronological order)
             if filter_params.reverse_order:
-                message_ids = message_ids[::-1]  # Reverse the list for newest first
-            
-            # Apply start_uid filter if specified
-            if filter_params.start_uid:
-                try:
-                    start_index = message_ids.index(filter_params.start_uid.encode())
-                    message_ids = message_ids[start_index:]
-                except ValueError:
-                    logger.warning(f"Start UID {filter_params.start_uid} not found")
+                message_numbers = message_numbers[::-1]  # Reverse for newest first
             
             # Apply limit
             if filter_params.limit > 0:
-                message_ids = message_ids[:filter_params.limit]
+                message_numbers = message_numbers[:filter_params.limit]
             
             # Fetch and parse emails
             emails = []
-            for msg_id in message_ids:
+            for msg_num in message_numbers:
                 try:
-                    parsed_email = await self._fetch_and_parse_email(msg_id.decode())
-                    emails.append(parsed_email)
+                    parsed_email = await self._fetch_and_parse_email(msg_num)
+                    
+                    # Apply date filters
+                    if self._matches_date_filter(parsed_email, filter_params):
+                        emails.append(parsed_email)
+                        
                 except Exception as e:
-                    logger.error(f"Failed to parse email {msg_id}: {e}")
+                    logger.error(f"Failed to parse POP3 email {msg_num}: {e}")
                     continue
             
-            logger.info(f"Fetched {len(emails)} emails from {filter_params.folder}")
+            logger.info(f"Fetched {len(emails)} emails from POP3 server")
             return emails
             
         except Exception as e:
-            logger.error(f"Failed to fetch emails: {e}")
+            logger.error(f"Failed to fetch POP3 emails: {e}")
             raise
     
-    def _build_search_criteria(self, filter_params: EmailFilter) -> str:
-        """Build IMAP search criteria string."""
-        criteria = ["ALL"]
-        
-        if filter_params.start_date:
-            # IMAP SINCE includes the specified date
-            date_str = filter_params.start_date.strftime("%d-%b-%Y")
-            criteria.append(f"SINCE {date_str}")
-        
-        if filter_params.end_date:
-            # IMAP BEFORE excludes the specified date
-            # For end_date like 2025-07-22 00:00:00, we want emails before 2025-07-22
-            # But since BEFORE excludes the date, we need to add 1 day to include the end_date
-            end_date_plus_one = filter_params.end_date + timedelta(days=1)
-            date_str = end_date_plus_one.strftime("%d-%b-%Y")
-            criteria.append(f"BEFORE {date_str}")
-        
-        return " ".join(criteria)
+    def _matches_date_filter(self, email_data: ParsedEmail, filter_params: EmailFilter) -> bool:
+        """Check if email matches date filter criteria."""
+        if filter_params.start_date and email_data.date < filter_params.start_date:
+            return False
+        if filter_params.end_date and email_data.date > filter_params.end_date:
+            return False
+        return True
     
-    async def _fetch_and_parse_email(self, uid: str) -> ParsedEmail:
-        """Fetch and parse a single email."""
+    async def _fetch_and_parse_email(self, msg_num: int) -> ParsedEmail:
+        """Fetch and parse a single email from POP3."""
         # Fetch email data
-        typ, msg_data = await asyncio.get_event_loop().run_in_executor(
-            None, self._connection.fetch, uid, '(RFC822)'
+        response, lines, octets = await asyncio.get_event_loop().run_in_executor(
+            None, self._connection.retr, msg_num
         )
         
-        if typ != 'OK':
-            raise Exception(f"Failed to fetch email {uid}")
-        
-        # Parse email
-        raw_email = msg_data[0][1]
+        # Join lines to create raw email
+        raw_email = b'\n'.join(lines)
         email_message = email.message_from_bytes(raw_email)
         
         # Extract basic information
@@ -225,7 +200,7 @@ class EmailClient:
         attachments = self._extract_attachment_info(email_message)
         
         return ParsedEmail(
-            uid=uid,
+            uid=str(msg_num),  # POP3 uses message numbers as UIDs
             sender=sender,
             recipients=recipients,
             cc=cc,
@@ -359,40 +334,6 @@ class EmailClient:
             # Links
             content = re.sub(r'<a[^>]*href=["\']([^"\'>]*)["\'][^>]*>(.*?)</a>', r'[\2](\1)', content, flags=re.DOTALL | re.IGNORECASE)
             
-            # Images
-            content = re.sub(r'<img[^>]*src=["\']([^"\'>]*)["\'][^>]*alt=["\']([^"\'>]*)["\'][^>]*/?>', r'![\2](\1)', content, flags=re.DOTALL | re.IGNORECASE)
-            content = re.sub(r'<img[^>]*alt=["\']([^"\'>]*)["\'][^>]*src=["\']([^"\'>]*)["\'][^>]*/?>', r'![\1](\2)', content, flags=re.DOTALL | re.IGNORECASE)
-            content = re.sub(r'<img[^>]*src=["\']([^"\'>]*)["\'][^>]*/?>', r'![Image](\1)', content, flags=re.DOTALL | re.IGNORECASE)
-            
-            # Lists
-            content = re.sub(r'<ul[^>]*>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'</ul>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'<ol[^>]*>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'</ol>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1\n', content, flags=re.DOTALL | re.IGNORECASE)
-            
-            # Paragraphs and line breaks
-            content = re.sub(r'<p[^>]*>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'</p>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'<br[^>]*/?>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'<div[^>]*>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'</div>', '\n', content, flags=re.IGNORECASE)
-            
-            # Tables (basic conversion)
-            content = re.sub(r'<table[^>]*>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'</table>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'<tr[^>]*>', '', content, flags=re.IGNORECASE)
-            content = re.sub(r'</tr>', '\n', content, flags=re.IGNORECASE)
-            content = re.sub(r'<(th|td)[^>]*>(.*?)</\1>', r'\2 | ', content, flags=re.DOTALL | re.IGNORECASE)
-            
-            # Code blocks
-            content = re.sub(r'<pre[^>]*><code[^>]*>(.*?)</code></pre>', r'```\n\1\n```', content, flags=re.DOTALL | re.IGNORECASE)
-            content = re.sub(r'<code[^>]*>(.*?)</code>', r'`\1`', content, flags=re.DOTALL | re.IGNORECASE)
-            content = re.sub(r'<pre[^>]*>(.*?)</pre>', r'```\n\1\n```', content, flags=re.DOTALL | re.IGNORECASE)
-            
-            # Blockquotes
-            content = re.sub(r'<blockquote[^>]*>(.*?)</blockquote>', r'> \1\n', content, flags=re.DOTALL | re.IGNORECASE)
-            
             # Remove remaining HTML tags
             content = re.sub(r'<[^>]+>', '', content)
             
@@ -404,17 +345,7 @@ class EmailClient:
                 '&gt;': '>',
                 '&quot;': '"',
                 '&#39;': "'",
-                '&apos;': "'",
-                '&copy;': '©',
-                '&reg;': '®',
-                '&trade;': '™',
-                '&hellip;': '...',
-                '&mdash;': '—',
-                '&ndash;': '–',
-                '&ldquo;': '"',
-                '&rdquo;': '"',
-                '&lsquo;': ''',
-                '&rsquo;': '''
+                '&apos;': "'"
             }
             
             for entity, replacement in html_entities.items():
@@ -454,7 +385,7 @@ class EmailClient:
                             "original_filename": decoded_filename,  # Use decoded filename for consistency
                             "content_type": part.get_content_type(),
                             "size": len(part.get_payload(decode=True) or b''),
-                            "part": part  # Re-add part field for attachment download
+                            "part": part  # Store part for later download
                         })
         
         return attachments
@@ -462,22 +393,8 @@ class EmailClient:
     async def send_email(self, to_addresses: List[str], subject: str, body: str, 
                         cc_addresses: Optional[List[str]] = None, 
                         bcc_addresses: Optional[List[str]] = None,
-                        html_body: Optional[str] = None,
-                        attachment_paths: Optional[List[str]] = None) -> bool:
-        """Send an email using SMTP.
-        
-        Args:
-            to_addresses: List of recipient email addresses
-            subject: Email subject
-            body: Plain text email body
-            cc_addresses: List of CC email addresses
-            bcc_addresses: List of BCC email addresses
-            html_body: HTML email body (optional)
-            attachment_paths: List of file paths to attach (optional)
-        
-        Returns:
-            True if email was sent successfully
-        """
+                        html_body: Optional[str] = None) -> bool:
+        """Send an email using SMTP."""
         if not self.smtp_config:
             raise ValueError("SMTP configuration not provided")
         
@@ -534,14 +451,11 @@ class EmailClient:
         finally:
             server.quit()
     
-    async def __aenter__(self):
-        """Async context manager entry."""
-        await self.connect()
-        return self
-    
     async def search_emails(self, keywords: str, search_type: str = "all", 
                            page_size: int = 5, last_uid: Optional[str] = None) -> Dict[str, Any]:
         """Search emails by keywords and search type with pagination.
+        
+        Note: POP3 doesn't support server-side search, so we fetch emails and search locally.
         
         Args:
             keywords: Space-separated keywords to search for
@@ -553,74 +467,64 @@ class EmailClient:
             Dict containing emails, has_more flag, and last_uid for next page
         """
         if not self._connection:
-            raise Exception("Not connected to email server")
-        
-        # Select INBOX folder first to ensure proper IMAP state
-        await asyncio.get_event_loop().run_in_executor(
-            None, self._connection.select, "INBOX"
-        )
+            raise Exception("Not connected to POP3 server")
         
         # Split keywords by space
         keyword_list = [kw.strip() for kw in keywords.split() if kw.strip()]
         if not keyword_list:
             return {"emails": [], "has_more": False, "last_uid": None}
         
-        # Get all email UIDs
-        typ, data = await asyncio.get_event_loop().run_in_executor(
-            None, self._connection.search, None, 'ALL'
+        # Get message count
+        num_messages, total_size = await asyncio.get_event_loop().run_in_executor(
+            None, self._connection.stat
         )
         
-        if typ != 'OK':
-            raise Exception("Failed to search emails")
-        
-        all_uids = data[0].split()
-        if not all_uids:
+        if num_messages == 0:
             return {"emails": [], "has_more": False, "last_uid": None}
         
-        # Convert UIDs to strings and sort in descending order (newest first)
-        all_uids = [uid.decode('utf-8') for uid in all_uids]
-        all_uids.sort(key=int, reverse=True)
+        # Get all message numbers in descending order (newest first)
+        all_msg_nums = list(range(num_messages, 0, -1))
         
         # Find starting position if last_uid is provided
         start_index = 0
         if last_uid:
             try:
-                start_index = all_uids.index(last_uid) + 1
-            except ValueError:
+                start_index = all_msg_nums.index(int(last_uid)) + 1
+            except (ValueError, TypeError):
                 # If last_uid not found, start from beginning
                 start_index = 0
         
         # Search through emails starting from the specified position
         matching_emails = []
         checked_count = 0
-        max_check = min(len(all_uids) - start_index, page_size * 10)  # Limit search scope
+        max_check = min(len(all_msg_nums) - start_index, page_size * 10)  # Limit search scope
         
-        for i in range(start_index, len(all_uids)):
+        for i in range(start_index, len(all_msg_nums)):
             if len(matching_emails) >= page_size:
                 break
             
             if checked_count >= max_check:
                 break
                 
-            uid = all_uids[i]
+            msg_num = all_msg_nums[i]
             checked_count += 1
             
             try:
                 # Fetch and parse email
-                email_data = await self._fetch_and_parse_email(uid)
+                email_data = await self._fetch_and_parse_email(msg_num)
                 
                 # Check if email matches search criteria
                 if self._matches_search_criteria(email_data, keyword_list, search_type):
                     matching_emails.append(email_data)
                     
             except Exception as e:
-                logger.warning(f"Failed to process email {uid}: {e}")
+                logger.warning(f"Failed to process POP3 email {msg_num}: {e}")
                 continue
         
         # Determine if there are more emails
         has_more = False
         last_checked_index = start_index + checked_count - 1
-        if last_checked_index < len(all_uids) - 1:
+        if last_checked_index < len(all_msg_nums) - 1:
             # Check if there might be more matching emails
             has_more = True
         
@@ -628,9 +532,9 @@ class EmailClient:
         result_last_uid = None
         if matching_emails:
             result_last_uid = matching_emails[-1].uid
-        elif checked_count > 0 and last_checked_index < len(all_uids) - 1:
+        elif checked_count > 0 and last_checked_index < len(all_msg_nums) - 1:
             # If no matches found but there are more emails to check
-            result_last_uid = all_uids[last_checked_index]
+            result_last_uid = str(all_msg_nums[last_checked_index])
         
         return {
             "emails": [self._email_to_dict(email) for email in matching_emails],
@@ -690,7 +594,12 @@ class EmailClient:
             "date": email_data.date.isoformat(),
             "attachments": email_data.attachments
         }
-
+    
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self.connect()
+        return self
+    
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         await self.disconnect()

@@ -9,7 +9,7 @@ from dataclasses import asdict
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "DEBUG") -> None:
     """Setup logging configuration."""
     logging.basicConfig(
         level=getattr(logging, level.upper()),
@@ -103,27 +103,109 @@ def format_email_response(emails: List[Any]) -> Dict[str, Any]:
     """Format email list into standard JSON response."""
     formatted_emails = []
     
-    for email in emails:
-        # Convert dataclass to dict if needed
-        if hasattr(email, '__dict__'):
-            email_dict = asdict(email) if hasattr(email, '__dataclass_fields__') else email.__dict__
-        else:
-            email_dict = email
-        
-        # Remove raw_message for response (too large)
-        email_dict.pop('raw_message', None)
-        
-        # Format datetime objects
-        if 'date' in email_dict and isinstance(email_dict['date'], datetime):
-            email_dict['date'] = email_dict['date'].isoformat()
-        
-        # Format attachments
-        if 'attachments' in email_dict:
-            for attachment in email_dict['attachments']:
-                # Remove email part object
-                attachment.pop('part', None)
-        
-        formatted_emails.append(email_dict)
+    for i, email in enumerate(emails):
+        try:
+            logger.debug(f"Processing email {i}: type={type(email)}, has_dict={hasattr(email, '__dict__')}, has_dataclass_fields={hasattr(email, '__dataclass_fields__')}")
+            
+            # Convert dataclass to dict if needed
+            if hasattr(email, '__dataclass_fields__'):
+                # This is a dataclass, manually convert to avoid part object serialization issues
+                # Create a clean copy of attachments without 'part' field
+                clean_attachments = []
+                if hasattr(email, 'attachments') and email.attachments:
+                    for attachment in email.attachments:
+                        if isinstance(attachment, dict):
+                            # Remove any non-serializable fields including 'part'
+                            clean_attachment = {}
+                            for k, v in attachment.items():
+                                if k != 'part':  # Skip part field which contains EmailMessage objects
+                                    try:
+                                        # Test if the value is JSON serializable
+                                        import json
+                                        json.dumps(v)
+                                        clean_attachment[k] = v
+                                    except (TypeError, ValueError):
+                                        # Skip non-serializable values
+                                        logger.debug(f"Skipping non-serializable field {k} in attachment")
+                                        continue
+                            clean_attachments.append(clean_attachment)
+                        else:
+                            # Try to convert non-dict attachments to dict
+                            try:
+                                if hasattr(attachment, '__dict__'):
+                                    att_dict = {k: v for k, v in attachment.__dict__.items() if k != 'part'}
+                                    clean_attachments.append(att_dict)
+                                else:
+                                    clean_attachments.append(str(attachment))
+                            except Exception as att_err:
+                                logger.warning(f"Could not process attachment: {att_err}")
+                                continue
+                
+                email_dict = {
+                    'uid': getattr(email, 'uid', None),
+                    'sender': getattr(email, 'sender', None),
+                    'recipients': getattr(email, 'recipients', []),
+                    'cc': getattr(email, 'cc', []),
+                    'bcc': getattr(email, 'bcc', []),
+                    'subject': getattr(email, 'subject', ''),
+                    'content': getattr(email, 'content', ''),
+                    'date': getattr(email, 'date', None),
+                    'attachments': clean_attachments
+                    # Deliberately exclude raw_message and any part objects in attachments
+                }
+                logger.debug(f"Manually converted dataclass to dict for email {i}")
+            elif hasattr(email, '__dict__'):
+                # This has __dict__, copy it
+                email_dict = email.__dict__.copy()
+                logger.debug(f"Copied __dict__ for email {i}")
+            elif hasattr(email, 'copy'):
+                # This has copy method
+                email_dict = email.copy()
+                logger.debug(f"Used copy() method for email {i}")
+            elif isinstance(email, dict):
+                # This is already a dict
+                email_dict = email.copy()
+                logger.debug(f"Copied dict for email {i}")
+            else:
+                # Try to convert to dict
+                logger.warning(f"Email {i} is type {type(email)}, attempting dict conversion")
+                email_dict = dict(email)
+            
+            # Remove raw_message for response (too large)
+            email_dict.pop('raw_message', None)
+            
+            # Format datetime objects
+            if 'date' in email_dict and isinstance(email_dict['date'], datetime):
+                email_dict['date'] = email_dict['date'].isoformat()
+            
+            # Format attachments - only remove 'part' field if it exists
+            if 'attachments' in email_dict and email_dict['attachments']:
+                formatted_attachments = []
+                for j, attachment in enumerate(email_dict['attachments']):
+                    try:
+                        logger.debug(f"Processing attachment {j} for email {i}: type={type(attachment)}")
+                        # Create a new dict, removing 'part' field only if it exists
+                        if isinstance(attachment, dict):
+                            formatted_attachment = {k: v for k, v in attachment.items() if k != 'part'}
+                            formatted_attachments.append(formatted_attachment)
+                        else:
+                            # Handle case where attachment might not be a dict
+                            logger.warning(f"Attachment {j} is not a dict: {type(attachment)} - {attachment}")
+                            formatted_attachments.append(str(attachment))
+                    except Exception as att_error:
+                        logger.error(f"Error formatting attachment {j} for email {i}: {att_error}")
+                        continue
+                email_dict['attachments'] = formatted_attachments
+            
+            formatted_emails.append(email_dict)
+            logger.debug(f"Successfully formatted email {i}")
+            
+        except Exception as e:
+            logger.error(f"Error formatting email {i}: {e} - Email type: {type(email)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            # Skip this email and continue
+            continue
     
     return {
         "status": "success",
@@ -174,36 +256,7 @@ def sanitize_filename(filename: str) -> str:
     return filename
 
 
-def extract_email_config(request_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract email server configuration from request."""
-    email_address = request_data["email_address"]
-    
-    # Extract domain from email
-    domain = email_address.split('@')[1].lower()
-    
-    # Common email server configurations
-    server_configs = {
-        'gmail.com': {'host': 'imap.gmail.com', 'port': 993, 'use_ssl': True},
-        'outlook.com': {'host': 'outlook.office365.com', 'port': 993, 'use_ssl': True},
-        'hotmail.com': {'host': 'outlook.office365.com', 'port': 993, 'use_ssl': True},
-        'yahoo.com': {'host': 'imap.mail.yahoo.com', 'port': 993, 'use_ssl': True},
-        'icloud.com': {'host': 'imap.mail.me.com', 'port': 993, 'use_ssl': True},
-    }
-    
-    # Get configuration or use defaults
-    config = server_configs.get(domain, {
-        'host': f'imap.{domain}',
-        'port': 993,
-        'use_ssl': True
-    })
-    
-    # Add credentials
-    config.update({
-        'username': email_address,
-        'password': request_data.get('password', ''),
-    })
-    
-    return config
+# extract_email_config function removed - now using ConfigManager
 
 
 def create_success_response(data: Any, message: str = "Operation completed successfully") -> Dict[str, Any]:
@@ -216,11 +269,11 @@ def create_success_response(data: Any, message: str = "Operation completed succe
     }
 
 
-def log_request(request_data: Dict[str, Any], request_id: Optional[str] = None) -> None:
+def log_request(tool_name: str, arguments: Dict[str, Any], request_id: Optional[str] = None) -> None:
     """Log incoming request (without sensitive data)."""
-    safe_data = request_data.copy()
+    safe_data = arguments.copy()
     
-    # Remove sensitive information
+    # Remove sensitive information (passwords should no longer be in arguments)
     safe_data.pop('password', None)
     
     # Truncate email address for privacy
@@ -230,7 +283,13 @@ def log_request(request_data: Dict[str, Any], request_id: Optional[str] = None) 
             username, domain = email.split('@', 1)
             safe_data['email_address'] = f"{username[:3]}***@{domain}"
     
-    log_msg = f"Request received: {safe_data}"
+    if 'from_address' in safe_data:
+        email = safe_data['from_address']
+        if '@' in email:
+            username, domain = email.split('@', 1)
+            safe_data['from_address'] = f"{username[:3]}***@{domain}"
+    
+    log_msg = f"Tool '{tool_name}' called with: {safe_data}"
     if request_id:
         log_msg = f"[{request_id}] {log_msg}"
     

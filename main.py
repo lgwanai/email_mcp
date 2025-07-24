@@ -5,6 +5,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Add src directory to Python path
 src_path = Path(__file__).parent / "src"
@@ -43,14 +47,14 @@ def parse_arguments():
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging level (default: INFO)"
+        default=os.getenv("LOG_LEVEL", "INFO"),
+        help="Logging level (default: INFO, can be overridden by LOG_LEVEL env var)"
     )
     
     parser.add_argument(
         "--attachments-dir",
-        default="attachments",
-        help="Directory to store attachments (default: attachments)"
+        default=os.getenv("ATTACHMENTS_DIR", "attachments"),
+        help="Directory to store attachments (default: from ATTACHMENTS_DIR env var or 'attachments')"
     )
     
     return parser.parse_args()
@@ -61,13 +65,13 @@ def main():
     args = parse_arguments()
     
     # Setup logging
-    setup_logging(args.log_level)
+    setup_logging("DEBUG")
     
     # Create attachments directory
     os.makedirs(args.attachments_dir, exist_ok=True)
     
     # Create and configure server
-    server = EmailMCPServer("Email MCP Server")
+    server = EmailMCPServer("Email MCP Server", args.attachments_dir)
     
     try:
         if args.transport == "sse":

@@ -1,0 +1,39 @@
+{
+  "email_address": "986007792@qq.com",
+  "email_uid": "12053",
+  "download_time": "2025-07-24T08:26:44.419708",
+  "total_attachments": 3,
+  "successful_downloads": 3,
+  "attachments": [
+    {
+      "filename": "酒店盲盒用户反馈全集.csv",
+      "original_filename": "酒店盲盒用户反馈全集.csv",
+      "content_type": "application/octet-stream",
+      "size": 3557,
+      "safe_filename": "酒店盲盒用户反馈全集.csv",
+      "local_path": "custom_attachments/986007792-qq_com/12053/酒店盲盒用户反馈全集.csv",
+      "download_status": "success",
+      "download_time": "2025-07-24T08:26:44.418547"
+    },
+    {
+      "filename": "客服投诉类型分析.csv",
+      "original_filename": "客服投诉类型分析.csv",
+      "content_type": "application/octet-stream",
+      "size": 1514,
+      "safe_filename": "客服投诉类型分析.csv",
+      "local_path": "custom_attachments/986007792-qq_com/12053/客服投诉类型分析.csv",
+      "download_status": "success",
+      "download_time": "2025-07-24T08:26:44.419148"
+    },
+    {
+      "filename": "客服投诉周报_每日概览.csv",
+      "original_filename": "客服投诉周报_每日概览.csv",
+      "content_type": "application/octet-stream",
+      "size": 406,
+      "safe_filename": "客服投诉周报_每日概览.csv",
+      "local_path": "custom_attachments/986007792-qq_com/12053/客服投诉周报_每日概览.csv",
+      "download_status": "success",
+      "download_time": "2025-07-24T08:26:44.419646"
+    }
+  ]
+}

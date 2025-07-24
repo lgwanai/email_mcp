@@ -9,6 +9,7 @@ import logging
 import json
 from datetime import datetime
 from email.message import EmailMessage
+from archive_manager import ArchiveManager
 
 logger = logging.getLogger(__name__)
 
@@ -19,15 +20,22 @@ class AttachmentManager:
     def __init__(self, base_path: str = "attachments"):
         self.base_path = Path(base_path)
         self.base_path.mkdir(exist_ok=True)
+        self.archive_manager = ArchiveManager()
+    
+    def _get_email_attachment_dir(self, email_address: str, email_uid: str) -> Path:
+        """Get the attachment directory for a specific email."""
+        # Convert email address to safe folder name
+        email_folder = email_address.replace('@', '-').replace('.', '_')
+        return self.base_path / email_folder / email_uid
         
-    async def download_attachments(self, email_uid: str, attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def download_attachments(self, email_address: str, email_uid: str, attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Download all attachments for an email."""
         if not attachments:
             return []
         
         # Create directory for this email's attachments
-        email_dir = self.base_path / email_uid
-        email_dir.mkdir(exist_ok=True)
+        email_dir = self._get_email_attachment_dir(email_address, email_uid)
+        email_dir.mkdir(parents=True, exist_ok=True)
         
         downloaded_attachments = []
         
@@ -51,9 +59,21 @@ class AttachmentManager:
                 downloaded_attachments.append(error_info)
         
         # Save attachment metadata
-        await self._save_attachment_metadata(email_uid, downloaded_attachments)
+        await self._save_attachment_metadata(email_address, email_uid, downloaded_attachments)
         
-        logger.info(f"Downloaded {len([a for a in downloaded_attachments if a.get('download_status') == 'success'])} attachments for email {email_uid}")
+        # Process archives if any attachments were successfully downloaded and auto extraction is enabled
+        auto_extract = os.getenv('AUTO_EXTRACT_ARCHIVES', 'true').lower() in ('true', '1', 'yes', 'on')
+        successful_downloads = [a for a in downloaded_attachments if a.get('download_status') == 'success']
+        if successful_downloads and auto_extract:
+            try:
+                extraction_log = await self.archive_manager.process_email_attachments(email_dir)
+                logger.info(f"Archive extraction completed for email {email_uid}: {extraction_log.get('total_extracted', 0)} files extracted")
+            except Exception as e:
+                logger.error(f"Failed to process archives for email {email_uid}: {e}")
+        elif successful_downloads and not auto_extract:
+            logger.debug(f"Archive auto-extraction is disabled, skipping extraction for email {email_uid}")
+        
+        logger.info(f"Downloaded {len(successful_downloads)} attachments for email {email_uid}")
         return downloaded_attachments
     
     async def _download_single_attachment(self, email_dir: Path, attachment: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -64,7 +84,8 @@ class AttachmentManager:
         part = attachment.get("part")
         
         if not part:
-            raise ValueError("No email part found for attachment")
+            logger.error(f"No email part found for attachment {filename} (index {index}). Available keys: {list(attachment.keys())}")
+            raise ValueError(f"No email part found for attachment {filename}. This usually means the email part object was not properly preserved during processing.")
         
         # Sanitize filename for safe storage
         from utils import sanitize_filename
@@ -88,7 +109,8 @@ class AttachmentManager:
                 if existing_data == attachment_data:
                     # File already exists with same content, skip download
                     logger.debug(f"Attachment already exists with same content: {filename} -> {local_path}")
-                    return {
+                    skip_info = attachment.copy()  # Preserve original attachment info
+                    skip_info.update({
                         "filename": filename,
                         "original_filename": original_filename,
                         "safe_filename": safe_filename,
@@ -97,7 +119,10 @@ class AttachmentManager:
                         "local_path": str(local_path),
                         "download_status": "skipped_existing",
                         "download_time": datetime.now().isoformat()
-                    }
+                    })
+                    # Remove the email part object for JSON serialization
+                    skip_info.pop("part", None)
+                    return skip_info
                 else:
                     # File exists but content is different, create new filename
                     counter = 1
@@ -128,8 +153,9 @@ class AttachmentManager:
         async with aiofiles.open(local_path, 'wb') as f:
             await f.write(attachment_data)
         
-        # Prepare return info
-        download_info = {
+        # Prepare return info - preserve all original attachment info but remove part field for JSON serialization
+        download_info = attachment.copy()  # Start with original attachment info
+        download_info.update({
             "filename": filename,  # Decoded filename
             "original_filename": original_filename,  # Original encoded filename
             "safe_filename": safe_filename,  # Sanitized filename used for storage
@@ -138,16 +164,21 @@ class AttachmentManager:
             "local_path": str(local_path),
             "download_status": "success",
             "download_time": datetime.now().isoformat()
-        }
+        })
+        
+        # Remove the email part object for JSON serialization
+        download_info.pop("part", None)
         
         logger.debug(f"Downloaded attachment: {filename} -> {local_path}")
         return download_info
     
-    async def _save_attachment_metadata(self, email_uid: str, attachments: List[Dict[str, Any]]) -> None:
+    async def _save_attachment_metadata(self, email_address: str, email_uid: str, attachments: List[Dict[str, Any]]) -> None:
         """Save attachment metadata to JSON file."""
-        metadata_file = self.base_path / email_uid / "attachments.json"
+        email_dir = self._get_email_attachment_dir(email_address, email_uid)
+        metadata_file = email_dir / "attachments.json"
         
         metadata = {
+            "email_address": email_address,
             "email_uid": email_uid,
             "download_time": datetime.now().isoformat(),
             "total_attachments": len(attachments),
@@ -158,9 +189,10 @@ class AttachmentManager:
         async with aiofiles.open(metadata_file, 'w', encoding='utf-8') as f:
             await f.write(json.dumps(metadata, indent=2, ensure_ascii=False))
     
-    async def get_attachment_info(self, email_uid: str) -> Optional[Dict[str, Any]]:
+    async def get_attachment_info(self, email_address: str, email_uid: str) -> Optional[Dict[str, Any]]:
         """Get attachment metadata for an email."""
-        metadata_file = self.base_path / email_uid / "attachments.json"
+        email_dir = self._get_email_attachment_dir(email_address, email_uid)
+        metadata_file = email_dir / "attachments.json"
         
         if not metadata_file.exists():
             return None
@@ -173,10 +205,11 @@ class AttachmentManager:
             logger.error(f"Failed to read attachment metadata for {email_uid}: {e}")
             return None
     
-    async def read_attachment(self, email_uid: str, filename: str, parse_content: bool = False) -> Optional[bytes]:
+    async def read_attachment(self, email_address: str, email_uid: str, filename: str, parse_content: bool = False) -> Optional[bytes]:
         """Read attachment content by filename.
         
         Args:
+            email_address: Email address that owns the attachment
             email_uid: Email UID containing the attachment
             filename: Name of the attachment file
             parse_content: If True, try to parse document content using markitdown
@@ -184,7 +217,7 @@ class AttachmentManager:
         Returns:
             Raw file content as bytes, or None if not found
         """
-        email_dir = self.base_path / email_uid
+        email_dir = self._get_email_attachment_dir(email_address, email_uid)
         
         if not email_dir.exists():
             logger.warning(f"Email directory {email_uid} not found")
@@ -199,14 +232,14 @@ class AttachmentManager:
             actual_file_path = file_path
         else:
             # Try sanitized filename
-            from .utils import sanitize_filename
+            from utils import sanitize_filename
             safe_filename = sanitize_filename(filename)
             safe_file_path = email_dir / safe_filename
             if safe_file_path.exists():
                 actual_file_path = safe_file_path
             else:
                 # Try to find file by checking metadata
-                metadata = await self.get_attachment_info(email_uid)
+                metadata = await self.get_attachment_info(email_address, email_uid)
                 if metadata and 'attachments' in metadata:
                     for att in metadata['attachments']:
                         # Check if the requested filename matches any stored filename variants
@@ -234,17 +267,18 @@ class AttachmentManager:
         async with aiofiles.open(actual_file_path, 'rb') as f:
             return await f.read()
     
-    async def read_attachment_with_parsing(self, email_uid: str, filename: str) -> Dict[str, Any]:
+    async def read_attachment_with_parsing(self, email_address: str, email_uid: str, filename: str) -> Dict[str, Any]:
         """Read attachment and optionally parse content using markitdown.
         
         Args:
+            email_address: Email address that owns the attachment
             email_uid: Email UID containing the attachment
             filename: Name of the attachment file
             
         Returns:
             Dict containing file info and content (parsed or raw)
         """
-        email_dir = self.base_path / email_uid
+        email_dir = self._get_email_attachment_dir(email_address, email_uid)
         
         if not email_dir.exists():
             logger.warning(f"Email directory {email_uid} not found")
@@ -266,7 +300,7 @@ class AttachmentManager:
                 actual_file_path = safe_file_path
             else:
                 # Try to find file by checking metadata
-                metadata = await self.get_attachment_info(email_uid)
+                metadata = await self.get_attachment_info(email_address, email_uid)
                 if metadata and 'attachments' in metadata:
                     for att in metadata['attachments']:
                         # Check if the requested filename matches any stored filename variants
@@ -368,19 +402,72 @@ class AttachmentManager:
         
         return result
     
-    async def list_attachments(self, email_uid: str) -> List[str]:
-        """List all attachment filenames for an email."""
-        email_dir = self.base_path / email_uid
+    async def list_attachments(self, email_address: str, email_uid: str) -> Dict[str, Any]:
+        """List all attachments for an email, including directory structure."""
+        email_dir = self._get_email_attachment_dir(email_address, email_uid)
         
         if not email_dir.exists():
-            return []
+            return {
+                "email_uid": email_uid,
+                "total_files": 0,
+                "files": [],
+                "directories": [],
+                "structure": "flat"
+            }
         
-        attachments = []
-        for file in email_dir.iterdir():
-            if file.is_file() and file.name != "attachments.json":
-                attachments.append(file.name)
+        files = []
+        directories = []
         
-        return attachments
+        def scan_directory(dir_path: Path, relative_path: str = "") -> None:
+            """Recursively scan directory for files and subdirectories."""
+            for item in dir_path.iterdir():
+                if item.name in ["attachments.json", "extraction_log.json"]:
+                    continue
+                    
+                item_relative_path = f"{relative_path}/{item.name}" if relative_path else item.name
+                
+                if item.is_file():
+                    file_info = {
+                        "name": item.name,
+                        "path": item_relative_path,
+                        "size": item.stat().st_size,
+                        "modified_time": datetime.fromtimestamp(item.stat().st_mtime).isoformat(),
+                        "is_archive": self.archive_manager.is_archive(item),
+                        "type": "file"
+                    }
+                    files.append(file_info)
+                elif item.is_dir():
+                    dir_info = {
+                        "name": item.name,
+                        "path": item_relative_path,
+                        "type": "directory"
+                    }
+                    directories.append(dir_info)
+                    # Recursively scan subdirectory
+                    scan_directory(item, item_relative_path)
+        
+        scan_directory(email_dir)
+        
+        # Check if extraction log exists
+        extraction_log_path = email_dir / "extraction_log.json"
+        extraction_info = None
+        if extraction_log_path.exists():
+            try:
+                async with aiofiles.open(extraction_log_path, 'r', encoding='utf-8') as f:
+                    extraction_content = await f.read()
+                    extraction_info = json.loads(extraction_content)
+            except Exception as e:
+                logger.warning(f"Failed to read extraction log for {email_uid}: {e}")
+        
+        return {
+            "email_uid": email_uid,
+            "total_files": len(files),
+            "total_directories": len(directories),
+            "files": files,
+            "directories": directories,
+            "structure": "hierarchical" if directories else "flat",
+            "extraction_info": extraction_info
+        }
     
     async def cleanup_old_attachments(self, days: int = 30) -> int:
         """Clean up attachments older than specified days."""
