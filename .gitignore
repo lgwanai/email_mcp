@@ -144,6 +144,7 @@ cython_debug/
 
 # Attachments directory (contains downloaded email attachments)
 attachments/
+custom_attachments/
 
 # Logs
 *.log
