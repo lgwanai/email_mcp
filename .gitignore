@@ -145,6 +145,11 @@ cython_debug/
 # Attachments directory (contains downloaded email attachments)
 attachments/
 custom_attachments/
+priority_attachments/
+test_attachments/
+
+# Memory bank (project documentation)
+memory-bank/
 
 # Logs
 *.log
