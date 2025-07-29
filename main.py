@@ -33,15 +33,15 @@ def parse_arguments():
     
     parser.add_argument(
         "--host",
-        default="localhost",
-        help="Host to bind to for SSE transport (default: localhost)"
+        default=os.getenv("HOST", "localhost"),
+        help="Host to bind to for SSE transport (default: localhost, can be overridden by HOST env var)"
     )
     
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
-        help="Port to bind to for SSE transport (default: 8000)"
+        default=int(os.getenv("PORT", 8000)),
+        help="Port to bind to for SSE transport (default: 8000, can be overridden by PORT env var)"
     )
     
     parser.add_argument(

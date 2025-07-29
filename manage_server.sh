@@ -3,7 +3,12 @@
 # Email MCP Server Management Script
 # 用于启动、重启和停止邮件MCP服务器
 
-SERVER_PORT=8000
+# 从.env文件读取实际端口配置
+if [ -f ".env" ]; then
+    SERVER_PORT=$(grep "^PORT=" .env | cut -d'=' -f2)
+fi
+# 如果没有找到端口配置，使用默认值
+SERVER_PORT=${SERVER_PORT:-8000}
 SERVER_SCRIPT="main.py"
 PID_FILE=".server.pid"
 LOG_FILE="server.log"
@@ -108,9 +113,6 @@ stop_server() {
     else
         echo -e "${YELLOW}服务器未运行${NC}"
     fi
-    
-    # 额外检查端口并清理
-    kill_by_port
 }
 
 # 重启服务器
