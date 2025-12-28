@@ -60,12 +60,14 @@ def parse_arguments():
     return parser.parse_args()
 
 
+import asyncio
+
 def main():
     """Main function."""
     args = parse_arguments()
     
     # Setup logging
-    setup_logging("DEBUG")
+    setup_logging(args.log_level)
     
     # Create attachments directory
     os.makedirs(args.attachments_dir, exist_ok=True)
@@ -73,24 +75,33 @@ def main():
     # Create and configure server
     server = EmailMCPServer("Email MCP Server", args.attachments_dir)
     
-    try:
-        if args.transport == "sse":
-            print(f"Starting Email MCP Server on {args.host}:{args.port} with SSE transport")
-            print(f"Attachments will be stored in: {os.path.abspath(args.attachments_dir)}")
-            print(f"Server URL: http://{args.host}:{args.port}/sse")
-            print("Press Ctrl+C to stop the server")
-            server.run_sse(args.host, args.port)
-        else:
-            print("Starting Email MCP Server with stdio transport")
-            print(f"Attachments will be stored in: {os.path.abspath(args.attachments_dir)}")
-            print("Server is ready for stdio communication")
-            server.run_stdio()
+    async def amain():
+        try:
+            # Start background sync
+            asyncio.create_task(server.start_background_sync())
             
+            if args.transport == "sse":
+                print(f"Starting Email MCP Server on {args.host}:{args.port} with SSE transport")
+                print(f"Attachments will be stored in: {os.path.abspath(args.attachments_dir)}")
+                print(f"Server URL: http://{args.host}:{args.port}/sse")
+                print("Press Ctrl+C to stop the server")
+                await server.run_sse_async(args.host, args.port)
+            else:
+                print("Starting Email MCP Server with stdio transport")
+                print(f"Attachments will be stored in: {os.path.abspath(args.attachments_dir)}")
+                print("Server is ready for stdio communication")
+                await server.run_stdio_async()
+                
+        except asyncio.CancelledError:
+            print("\nShutting down server...")
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    try:
+        asyncio.run(amain())
     except KeyboardInterrupt:
         print("\nShutting down server...")
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

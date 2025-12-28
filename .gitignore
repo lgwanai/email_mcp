@@ -183,3 +183,8 @@ Desktop.ini
 # Local configuration overrides
 local_config.json
 config_override.json
+
+# Email Index Database
+email_index.db
+email_index.db-shm
+email_index.db-wal

@@ -8,11 +8,12 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 from fastmcp import FastMCP
-from email_client import EmailClient, EmailConfig, EmailFilter, SMTPConfig
+from email_client import EmailClient, EmailConfig, EmailFilter, SMTPConfig, ParsedEmail
 from pop3_client import POP3Client
 from email_client_factory import EmailClientFactory
 from attachment_manager import AttachmentManager
 from config_manager import ConfigManager
+from email_index_service import EmailIndexService
 from utils import (
     validate_email_request,
     format_email_response,
@@ -34,11 +35,26 @@ class EmailMCPServer:
         base_path = attachments_dir or os.getenv('ATTACHMENTS_DIR', 'attachments')
         self.attachment_manager = AttachmentManager(base_path)
         self.config_manager = ConfigManager()
+        
+        # Initialize Index Service
+        db_path = os.getenv('EMAIL_DB_PATH', 'email_index.db')
+        self.index_service = EmailIndexService(db_path, self.attachment_manager)
+        
         self._setup_tools()
         
         # Setup logging
         setup_logging()
         logger.info(f"Initialized {name} with attachments directory: {base_path}")
+
+    async def start_background_sync(self):
+        """Start the background synchronization task."""
+        sync_interval = int(os.getenv('EMAIL_SYNC_INTERVAL_SECONDS', '60'))
+        logger.info(f"Starting background sync with interval {sync_interval}s")
+        await self.index_service.start_background_sync(
+            EmailClientFactory, 
+            self.config_manager, 
+            sync_interval
+        )
     
     def _setup_tools(self) -> None:
         """Setup MCP tools."""
@@ -91,98 +107,123 @@ class EmailMCPServer:
                 account_config = self.config_manager.get_account_config(email_address)
                 if not account_config:
                     raise ValueError(f"No configuration found for email address: {email_address}")
+
+                # Check if sync state exists for this folder
+                sync_state = await self.index_service.get_sync_state(email_address, folder)
                 
-                # Create email filter
-                email_filter = EmailFilter(
-                    folder=validated_params["folder"],
-                    start_date=validated_params["start_date"],
-                    end_date=validated_params["end_date"],
+                if not sync_state:
+                     logger.info(f"[{request_id}] No sync state found, result might be empty until background sync runs")
+
+                logger.info(f"[{request_id}] Querying local index for {email_address}/{folder}")
+                db_rows = await self.index_service.list_emails(
+                    email_address, 
+                    folder,
                     limit=validated_params["limit"],
                     start_uid=validated_params["start_uid"],
-                    reverse_order=validated_params["reverse_order"]
+                    reverse_order=validated_params["reverse_order"],
+                    start_date=validated_params["start_date"],
+                    end_date=validated_params["end_date"]
                 )
                 
-                # Create email client using factory (supports both IMAP and POP3)
-                client = EmailClientFactory.create_client(account_config)
+                emails = []
+                client = None
                 
-                # Fetch emails
-                async with client:
-                    emails = await client.fetch_emails(email_filter)
-                
-                # Download attachments for each email
-                for email in emails:
-                    if email.attachments:
-                        try:
-                            # Keep original attachments with part objects for download
-                            # Use shallow copy to preserve part objects
-                            original_attachments = []
-                            for att in email.attachments:
-                                if isinstance(att, dict):
-                                    # Create a shallow copy to preserve the part object
-                                    att_copy = att.copy()
-                                    original_attachments.append(att_copy)
-                                else:
-                                    original_attachments.append(att)
+                if db_rows:
+                    for row in db_rows:
+                        # Reconstruct attachments metadata
+                        att_names = json.loads(row['attachment_names_json']) if row['attachment_names_json'] else []
+                        attachments_list = []
+                        missing_attachments = False
+                        
+                        current_att_dir = row['attachment_dir']
+                        
+                        for name in att_names:
+                            is_downloaded = False
+                            local_path = None
                             
-                            # Debug: Check if part objects exist
-                            for i, att in enumerate(original_attachments):
-                                has_part = 'part' in att if isinstance(att, dict) else False
-                                logger.debug(f"Attachment {i} has part: {has_part}, keys: {list(att.keys()) if isinstance(att, dict) else 'not dict'}")
+                            if current_att_dir:
+                                path = os.path.join(current_att_dir, name)
+                                if os.path.exists(path):
+                                    is_downloaded = True
+                                    local_path = path
                             
-                            downloaded_attachments = await self.attachment_manager.download_attachments(
-                                email_address, email.uid, original_attachments
-                            )
-                            # Keep the original attachments with part field intact, but create serializable version for response
-                            # The downloaded_attachments already have the download status and local_path info
-                            # We need to merge this info back to the original attachments while preserving part field
-                            for i, downloaded_att in enumerate(downloaded_attachments):
-                                if i < len(original_attachments) and isinstance(original_attachments[i], dict):
-                                    # Update original attachment with download info while preserving part field
-                                    original_attachments[i].update({
-                                        k: v for k, v in downloaded_att.items() 
-                                        if k not in ['part']  # Don't overwrite part field
-                                    })
+                            if not is_downloaded:
+                                missing_attachments = True
+                                
+                            attachments_list.append({
+                                "filename": name, 
+                                "download_status": "downloaded" if is_downloaded else "missing",
+                                "local_path": local_path
+                            })
+
+                        parsed = ParsedEmail(
+                            uid=row['uid'],
+                            sender=row['sender'],
+                            recipients=json.loads(row['recipients']),
+                            cc=json.loads(row['cc']),
+                            bcc=[], # Not stored in index currently
+                            subject=row['subject'],
+                            content=row['body'] or "",
+                            date=datetime.fromisoformat(row['date']),
+                            attachments=attachments_list,
+                            raw_message=b"" # Not stored
+                        )
+                        
+                        # Determine if we need to fetch from remote
+                        missing_body = (row['body'] is None)
+                        has_attachments_flag = (row['has_attachments'] == 1)
+                        
+                        # Only fetch if we have missing content that is expected
+                        need_fetch = missing_body or (has_attachments_flag and missing_attachments)
+                        
+                        if need_fetch:
+                            logger.info(f"[{request_id}] Fetching missing content for {row['uid']} (Body: {missing_body}, Attachments: {missing_attachments})")
                             
-                            # Create serializable version for JSON response (without part field)
-                            serializable_attachments = []
-                            for attachment in original_attachments:
-                                if isinstance(attachment, dict):
-                                    # Create a copy without the 'part' field for serialization
-                                    serializable_attachment = {k: v for k, v in attachment.items() if k != 'part'}
-                                    serializable_attachments.append(serializable_attachment)
-                                else:
-                                    serializable_attachments.append(attachment)
-                            email.attachments = serializable_attachments
-                        except Exception as e:
-                            logger.error(f"Failed to download attachments for email {email.uid}: {e}")
-                            # Keep original attachment info but mark as failed
                             try:
-                                new_attachments = []
-                                for attachment in email.attachments:
-                                    if isinstance(attachment, dict):
-                                        # Create a copy without the 'part' field
-                                        new_attachment = {k: v for k, v in attachment.items() if k != 'part'}
-                                        new_attachment['download_status'] = 'failed'
-                                        new_attachment['error'] = str(e)
-                                        new_attachments.append(new_attachment)
-                                    else:
-                                        # Convert to dict if it's not already
-                                        new_attachments.append({
-                                            'filename': getattr(attachment, 'filename', 'unknown'),
-                                            'content_type': getattr(attachment, 'content_type', 'unknown'),
-                                            'size': getattr(attachment, 'size', 0),
-                                            'download_status': 'failed',
-                                            'error': str(e)
-                                        })
-                                email.attachments = new_attachments
-                            except Exception as attachment_error:
-                                logger.error(f"Error processing attachments for email {email.uid}: {attachment_error}")
-                                # Clear attachments if processing fails
-                                email.attachments = []
+                                if not client:
+                                    client = EmailClientFactory.create_client(account_config)
+                                    await client.connect()
+                                
+                                # Fetch full email
+                                full_email = await client._fetch_and_parse_email(row['uid'])
+                                
+                                # Handle Body
+                                if missing_body:
+                                    await self.index_service.update_email_body(
+                                        email_address, folder, row['uid'], full_email.content
+                                    )
+                                    parsed.content = full_email.content
+                                
+                                # Handle Attachments
+                                if has_attachments_flag and missing_attachments:
+                                    # Download attachments using AttachmentManager
+                                    downloaded_atts = await self.attachment_manager.download_attachments(
+                                        email_address, row['uid'], full_email.attachments
+                                    )
+                                    
+                                    # Update parsed object
+                                    parsed.attachments = downloaded_atts
+                                    
+                                    # Update DB attachment_dir if we successfully downloaded something
+                                    if downloaded_atts:
+                                        email_dir = self.attachment_manager._get_email_attachment_dir(email_address, row['uid'])
+                                        await self.index_service.update_attachment_dir(
+                                            email_address, folder, row['uid'], str(email_dir)
+                                        )
+
+                            except Exception as e:
+                                logger.error(f"Failed to fetch remote content for {row['uid']}: {e}")
+                                # Continue with what we have
+                        
+                        emails.append(parsed)
                 
+                if client:
+                    await client.disconnect()
+
                 # Format response
                 response = format_email_response(emails)
                 response["request_id"] = request_id
+                response["source"] = "db"
                 
                 logger.info(f"[{request_id}] Successfully fetched {len(emails)} emails")
                 return response
@@ -191,6 +232,137 @@ class EmailMCPServer:
                 logger.error(f"[{request_id}] Error fetching emails: {e}")
                 return format_error_response(e, request_id)
         
+        @self.mcp.tool()
+        async def search_emails(
+            keywords: List[str],
+            email_address: Optional[str] = None,
+            search_type: str = "comprehensive",
+            limit: int = 10,
+            offset: int = 0
+        ) -> Dict[str, Any]:
+            """Search emails in local index.
+            
+            Args:
+                keywords: List of keywords (OR logic, any match hits)
+                email_address: Email account to search (Optional, if None searches all accounts)
+                search_type: Search scope ("comprehensive", "sender", "recipient", "subject", "body")
+                limit: Max results per page (default: 10)
+                offset: Pagination offset (default: 0)
+            """
+            try:
+                # Log request
+                log_request("search_emails", {
+                    "email_address": email_address, 
+                    "keywords": keywords,
+                    "search_type": search_type,
+                    "limit": limit,
+                    "offset": offset
+                })
+                
+                # Check config only if email_address is provided
+                if email_address:
+                    account_config = self.config_manager.get_account_config(email_address)
+                    if not account_config:
+                        raise ValueError(f"No configuration found for email address: {email_address}")
+
+                # Map search_type to fields
+                search_fields = None
+                if search_type != "comprehensive":
+                    valid_types = ["sender", "recipient", "subject", "body"]
+                    if search_type not in valid_types:
+                        raise ValueError(f"Invalid search_type: {search_type}. Must be one of {valid_types} or 'comprehensive'")
+                    search_fields = [search_type]
+
+                # Perform search
+                db_rows, total_count = await self.index_service.search_emails(
+                    email_address,
+                    keywords,
+                    search_fields,
+                    limit,
+                    offset
+                )
+                
+                # Convert to ParsedEmail objects and generate summaries
+                emails = []
+                import re
+                
+                # Pre-compile regex for keywords (case insensitive)
+                # Escape keywords to avoid regex errors
+                escaped_keywords = [re.escape(k) for k in keywords]
+                keyword_pattern = re.compile(f"({'|'.join(escaped_keywords)})", re.IGNORECASE)
+
+                for row in db_rows:
+                    # Reconstruct attachments metadata
+                    att_names = json.loads(row['attachment_names_json']) if row['attachment_names_json'] else []
+                    attachments = []
+                    for name in att_names:
+                        att_info = {"filename": name, "download_status": "unknown"}
+                        if row['attachment_dir']:
+                            att_info["local_path"] = os.path.join(row['attachment_dir'], name)
+                            att_info["download_status"] = "downloaded"
+                        attachments.append(att_info)
+                    
+                    # Generate Summary for Content
+                    content = row['body'] or ""
+                    summary = []
+                    if content:
+                        # Find all matches
+                        matches = list(keyword_pattern.finditer(content))
+                        if matches:
+                            for match in matches:
+                                start = match.start()
+                                end = match.end()
+                                # Extract context: +/- 20 chars
+                                ctx_start = max(0, start - 20)
+                                ctx_end = min(len(content), end + 20)
+                                snippet = content[ctx_start:ctx_end]
+                                # Add ellipsis if truncated
+                                if ctx_start > 0:
+                                    snippet = "..." + snippet
+                                if ctx_end < len(content):
+                                    snippet = snippet + "..."
+                                summary.append(snippet)
+                        else:
+                            # If no keyword in body (maybe matched in subject/sender), show beginning
+                            summary.append(content[:100] + "..." if len(content) > 100 else content)
+                    
+                    parsed = ParsedEmail(
+                        uid=row['uid'],
+                        sender=row['sender'],
+                        recipients=json.loads(row['recipients']),
+                        cc=json.loads(row['cc']),
+                        bcc=[], 
+                        subject=row['subject'],
+                        content=summary, # Replace content with summary array
+                        date=datetime.fromisoformat(row['date']),
+                        attachments=attachments,
+                        raw_message=b"" 
+                    )
+                    emails.append(parsed)
+
+                # Format basic response
+                response = format_email_response(emails)
+                
+                # Add pagination info
+                current_page = (offset // limit) + 1
+                total_pages = (total_count + limit - 1) // limit if limit > 0 else 0
+                
+                response.update({
+                    "source": "local_search",
+                    "pagination": {
+                        "total_items": total_count,
+                        "total_pages": total_pages,
+                        "current_page": current_page,
+                        "page_size": limit
+                    }
+                })
+                
+                return response
+
+            except Exception as e:
+                logger.error(f"Error searching emails: {e}")
+                return format_error_response(e)
+
         @self.mcp.tool()
         async def get_attachment_info(email_address: str, email_uid: str) -> Dict[str, Any]:
             """Get attachment information for a specific email.
@@ -357,115 +529,95 @@ class EmailMCPServer:
                 logger.error(f"Error extracting archives for {email_uid}: {e}")
                 return format_error_response(e)
         
+
+        
         @self.mcp.tool()
-        async def search_emails(
-            keywords: str,
-            search_type: str = "all",
-            page_size: int = 5,
-            last_uid: Optional[str] = None
+        async def list_emails(
+            email_address: str,
+            folder: str = "INBOX",
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            limit: int = 50,
+            start_uid: Optional[str] = None,
+            reverse_order: bool = True
         ) -> Dict[str, Any]:
-            """Search emails by keywords and search type with pagination support.
+            """List emails from local index efficiently (pure DB query).
             
             Args:
-                keywords: Space-separated keywords to search for
-                search_type: Type of search (sender, recipient, cc, subject, content, attachment, all)
-                page_size: Number of emails per page (1-50, default: 5)
-                last_uid: UID of the last email from previous page for pagination
-            
-            Returns:
-                JSON response with search results
+                email_address: Email address
+                folder: Folder name (default: INBOX)
+                start_date: Filter by start date (YYYY-MM-DD)
+                end_date: Filter by end date (YYYY-MM-DD)
+                limit: Max records (default: 50)
+                start_uid: Pagination start UID
+                reverse_order: Newest first (default: True)
             """
-            request_id = f"search_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            
             try:
-                # Validate search parameters
-                if not keywords or not keywords.strip():
-                    raise ValueError("Keywords cannot be empty")
+                # Parse dates
+                start_dt = datetime.fromisoformat(start_date) if start_date else None
+                end_dt = datetime.fromisoformat(end_date) if end_date else None
                 
-                if search_type not in ["sender", "recipient", "cc", "subject", "content", "attachment", "all"]:
-                    raise ValueError(f"Invalid search_type: {search_type}")
-                
-                if page_size < 1 or page_size > 50:
-                    raise ValueError("page_size must be between 1 and 50")
-                
-                # Log search request
-                logger.info(f"[{request_id}] Searching emails with keywords: '{keywords}', type: {search_type}")
-                 
-                 # Get default email configuration from config manager
-                default_account = self.config_manager.get_default_account()
-                if not default_account:
-                    raise ValueError("No default email account configured for search")
-                
-                # Create email client using factory (supports both IMAP and POP3)
-                client = EmailClientFactory.create_client(default_account)
-                 
-                async with client:
-                     search_result = await client.search_emails(
-                         keywords=keywords,
-                         search_type=search_type,
-                         page_size=page_size,
-                         last_uid=last_uid
-                    )
-                
-                # Process attachments for search results
-                emails_with_attachments = []
-                for email_dict in search_result["emails"]:
-                    if email_dict.get("attachments"):
-                        try:
-                            # Download attachments with existence check
-                            downloaded_attachments = await self.attachment_manager.download_attachments(
-                                default_account.email_address, email_dict["uid"], email_dict["attachments"]
-                            )
-                            # Remove 'part' field from downloaded attachments for serialization
-                            # Create a copy without the part field to avoid modifying the original
-                            serializable_attachments = []
-                            for attachment in downloaded_attachments:
-                                if isinstance(attachment, dict):
-                                    # Create a copy without the 'part' field for serialization
-                                    serializable_attachment = {k: v for k, v in attachment.items() if k != 'part'}
-                                    serializable_attachments.append(serializable_attachment)
-                                else:
-                                    serializable_attachments.append(attachment)
-                            email_dict["attachments"] = serializable_attachments
-                        except Exception as e:
-                            logger.error(f"Failed to download attachments for email {email_dict['uid']}: {e}")
-                            # Keep original attachment info but mark as failed
-                            # Create a copy without the part field to avoid modifying the original
-                            failed_attachments = []
-                            for attachment in email_dict["attachments"]:
-                                if isinstance(attachment, dict):
-                                    # Create a copy without the 'part' field
-                                    failed_attachment = {k: v for k, v in attachment.items() if k != 'part'}
-                                    failed_attachment['download_status'] = 'failed'
-                                    failed_attachment['error'] = str(e)
-                                    failed_attachments.append(failed_attachment)
-                                else:
-                                    failed_attachments.append(attachment)
-                            email_dict["attachments"] = failed_attachments
-                    emails_with_attachments.append(email_dict)
-                 
-                search_results = {
-                     "emails": emails_with_attachments,
-                     "total_found": len(emails_with_attachments),
-                     "page_size": page_size,
-                     "has_more": search_result["has_more"],
-                     "last_uid": search_result["last_uid"],
-                     "search_params": {
-                         "keywords": keywords,
-                         "search_type": search_type,
-                         "last_uid": last_uid
-                     }
-                }
-                
-                return create_success_response(
-                    search_results,
-                    f"Search completed for keywords: '{keywords}'"
+                rows = await self.index_service.list_emails(
+                    email_address, folder, limit, start_uid, reverse_order, start_dt, end_dt
                 )
                 
+                # Convert to simpler list
+                emails = []
+                for row in rows:
+                    emails.append({
+                        "uid": row['uid'],
+                        "subject": row['subject'],
+                        "sender": row['sender'],
+                        "date": row['date'],
+                        "snippet": row['snippet'],
+                        "has_attachments": bool(row['has_attachments'])
+                    })
+                
+                return create_success_response(emails, f"Listed {len(emails)} emails from index")
             except Exception as e:
-                logger.error(f"[{request_id}] Error searching emails: {e}")
-                return format_error_response(e, request_id)
-        
+                return format_error_response(e)
+
+        @self.mcp.tool()
+        async def sync_email_index(
+            email_address: str,
+            folder: str = "INBOX",
+            mode: str = "incremental"
+        ) -> Dict[str, Any]:
+            """Trigger manual synchronization for email index.
+            
+            Args:
+                email_address: Email address
+                folder: Folder to sync
+                mode: 'incremental' or 'full' (full = initial sync)
+            """
+            try:
+                account_config = self.config_manager.get_account_config(email_address)
+                if not account_config:
+                    raise ValueError(f"Account {email_address} not found")
+                
+                client = EmailClientFactory.create_client(account_config)
+                async with client:
+                    if mode == "full":
+                        await self.index_service.sync_initial(client, folder)
+                    else:
+                        await self.index_service.sync_incremental(client, folder)
+                        
+                return create_success_response({"status": "completed"}, "Sync completed")
+            except Exception as e:
+                return format_error_response(e)
+
+        @self.mcp.tool()
+        async def get_index_status(
+            email_address: str,
+            folder: str = "INBOX"
+        ) -> Dict[str, Any]:
+            """Get synchronization status for a folder."""
+            try:
+                state = await self.index_service.get_sync_state(email_address, folder)
+                return create_success_response(state or {"status": "not_synced"}, "Index status retrieved")
+            except Exception as e:
+                return format_error_response(e)
+
         @self.mcp.tool()
         async def send_email(
             from_address: str,
@@ -593,6 +745,24 @@ class EmailMCPServer:
         """Get the FastMCP server instance."""
         return self.mcp
     
+    async def run_sse_async(self, host: str = "localhost", port: int = 8000) -> None:
+        """Run the MCP server with SSE transport asynchronously."""
+        logger.info(f"Starting Email MCP Server on {host}:{port} with SSE transport")
+        try:
+            await self.mcp.run_sse_async(host=host, port=port)
+        except Exception as e:
+            logger.error(f"Failed to start MCP server: {e}")
+            raise
+
+    async def run_stdio_async(self) -> None:
+        """Run the MCP server with stdio transport asynchronously."""
+        logger.info("Starting Email MCP Server with stdio transport")
+        try:
+            await self.mcp.run_stdio_async()
+        except Exception as e:
+            logger.error(f"Failed to start MCP server: {e}")
+            raise
+
     def run_sse(self, host: str = "localhost", port: int = 8000) -> None:
         """Run the MCP server with SSE transport."""
         logger.info(f"Starting Email MCP Server on {host}:{port} with SSE transport")

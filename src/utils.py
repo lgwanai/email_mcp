@@ -287,15 +287,15 @@ def log_request(tool_name: str, arguments: Dict[str, Any], request_id: Optional[
     safe_data.pop('password', None)
     
     # Truncate email address for privacy
-    if 'email_address' in safe_data:
+    if 'email_address' in safe_data and safe_data['email_address']:
         email = safe_data['email_address']
-        if '@' in email:
+        if isinstance(email, str) and '@' in email:
             username, domain = email.split('@', 1)
             safe_data['email_address'] = f"{username[:3]}***@{domain}"
     
-    if 'from_address' in safe_data:
+    if 'from_address' in safe_data and safe_data['from_address']:
         email = safe_data['from_address']
-        if '@' in email:
+        if isinstance(email, str) and '@' in email:
             username, domain = email.split('@', 1)
             safe_data['from_address'] = f"{username[:3]}***@{domain}"
     

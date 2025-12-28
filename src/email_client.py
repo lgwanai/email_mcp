@@ -111,6 +111,201 @@ class EmailClient:
             finally:
                 self._connection = None
     
+    async def fetch_full_emails_batch(self, uids: List[str], folder: str = "INBOX") -> List[ParsedEmail]:
+        """Fetch full emails (including attachments) for a batch of UIDs."""
+        if not self._connection:
+            await self.connect()
+            
+        try:
+            # Select folder
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._connection.select, folder
+            )
+            
+            if not uids:
+                return []
+                
+            emails = []
+            for uid in uids:
+                try:
+                    # Fetch full email for this UID
+                    parsed_email = await self._fetch_and_parse_email(uid)
+                    emails.append(parsed_email)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch/parse full email for {uid}: {e}")
+                    continue
+                    
+            return emails
+            
+        except Exception as e:
+            logger.error(f"Batch full fetch failed: {e}")
+            raise
+
+    async def fetch_headers_batch(self, uids: List[str], folder: str = "INBOX") -> List[ParsedEmail]:
+        """Fetch headers and metadata for a batch of emails efficiently."""
+        if not self._connection:
+            await self.connect()
+            
+        try:
+            # Select folder
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._connection.select, folder
+            )
+            
+            if not uids:
+                return []
+                
+            # Prepare UID string (comma separated)
+            uid_str = ",".join(uids)
+            
+            # Fetch headers and bodystructure
+            # We use BODY.PEEK to avoid marking as read if that's a concern, 
+            # though usually for sync we might not care, but let's be safe.
+            # We need:
+            # - RFC822.HEADER or BODY[HEADER]
+            # - INTERNALDATE (for reliable date)
+            # - FLAGS
+            # - BODYSTRUCTURE (to detect attachments)
+            fetch_cmd = '(FLAGS INTERNALDATE BODY.PEEK[HEADER] BODYSTRUCTURE)'
+            
+            typ, msg_data = await asyncio.get_event_loop().run_in_executor(
+                None, self._connection.uid, 'FETCH', uid_str, fetch_cmd
+            )
+            
+            if typ != 'OK':
+                raise Exception(f"Failed to fetch headers for {uid_str}")
+            
+            # Parse responses
+            # imaplib returns a list where each message part is an item.
+            # Complex to parse manually because response for one UID might be multiple items (header, bodystructure, etc.)
+            # But usually it is grouped.
+            
+            emails = []
+            
+            # Helper to parse individual message data
+            import email
+            from email.utils import parsedate_to_datetime
+            
+            # We need to group lines by message. 
+            # msg_data is a list of (response, data) tuples or strings.
+            # This is tricky with imaplib.
+            
+            # Alternative: Fetch one by one if batch is too hard to parse safely with imaplib's raw output,
+            # BUT that defeats the purpose of "batch".
+            
+            # Let's try to parse the list.
+            # Typically: [ (b'1 (UID 123 ...)', b'Header...'), b')', (b'2 ...', b'...') ]
+            
+            # A more robust way might be to iterate and collect.
+            # But for now, let's implement a simpler loop that fetches one by one if we want to be safe, 
+            # OR use a library helper. 
+            # Since we want performance, let's try to parse carefully.
+            
+            # Actually, let's look at _fetch_and_parse_email. It fetches one.
+            # Let's improve it to fetch batch if possible, but imaplib's structure is annoying.
+            
+            # Let's stick to "fetch one by one" inside a loop but parallelized?
+            # No, IMAP connection is stateful and single-threaded usually.
+            
+            # Compromise: Fetch in small batches or just loop. 
+            # Even looping with `fetch_headers_only` is faster than `fetch_full_body`.
+            
+            for uid in uids:
+                try:
+                    # Fetch specific fields for this UID
+                    # We can use the existing connection
+                    typ, data = await asyncio.get_event_loop().run_in_executor(
+                        None, self._connection.uid, 'FETCH', uid, '(BODY.PEEK[HEADER] INTERNALDATE FLAGS BODYSTRUCTURE)'
+                    )
+                    
+                    if typ != 'OK' or not data:
+                        continue
+                        
+                    # Parse the data
+                    # data[0] is typically (b'SEQ (UID ...)', b'Header content')
+                    # But sometimes it varies.
+                    
+                    # Let's parse the header content
+                    raw_header = None
+                    flags = []
+                    internal_date = None
+                    bodystructure = None
+                    
+                    for item in data:
+                        if isinstance(item, tuple):
+                            # It's the header data
+                            raw_header = item[1]
+                            # The first part has metadata
+                            meta = item[0].decode()
+                            # Extract flags, date... parsing raw IMAP response string is hard regex work.
+                        elif isinstance(item, bytes):
+                            # Closing parenthesis or similar
+                            pass
+                            
+                    if not raw_header:
+                        continue
+                        
+                    email_message = email.message_from_bytes(raw_header)
+                    
+                    # Extract info using existing helpers
+                    sender = self._decode_header(email_message.get('From', ''))
+                    recipients = self._parse_addresses(email_message.get('To', ''))
+                    cc = self._parse_addresses(email_message.get('Cc', ''))
+                    bcc = self._parse_addresses(email_message.get('Bcc', ''))
+                    subject = self._decode_header(email_message.get('Subject', ''))
+                    date_str = email_message.get('Date', '')
+                    
+                    # Parse date (logic copied from _fetch_and_parse_email)
+                    try:
+                        email_date = email.utils.parsedate_to_datetime(date_str)
+                        china_tz = timezone(timedelta(hours=8))
+                        if email_date.tzinfo is None:
+                            email_date = email_date.replace(tzinfo=china_tz)
+                        else:
+                            email_date = email_date.astimezone(china_tz)
+                    except Exception:
+                        china_tz = timezone(timedelta(hours=8))
+                        email_date = datetime.now(china_tz)
+                        
+                    # Snippet (from Subject for now, as we don't fetch body)
+                    content = "" # No body fetched
+                    
+                    # Attachments detection
+                    # To do this properly without downloading body, we need to parse BODYSTRUCTURE.
+                    # This is complex. For MVP, we can assume "has_attachments=False" or 
+                    # check Content-Type header if it is multipart/mixed.
+                    
+                    content_type = email_message.get_content_type()
+                    attachments = []
+                    if content_type == 'multipart/mixed':
+                        # Likely has attachments. 
+                        # Without parsing structure, we can't know names.
+                        # We'll mark as potentially having attachments.
+                        attachments.append({"filename": "unknown_check_details", "size": 0})
+                        
+                    emails.append(ParsedEmail(
+                        uid=uid,
+                        sender=sender,
+                        recipients=recipients,
+                        cc=cc,
+                        bcc=bcc,
+                        subject=subject,
+                        content=content,
+                        date=email_date,
+                        attachments=attachments,
+                        raw_message=raw_header # Store header as raw message
+                    ))
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to fetch/parse header for {uid}: {e}")
+                    continue
+                    
+            return emails
+            
+        except Exception as e:
+            logger.error(f"Batch fetch failed: {e}")
+            raise
+
     async def fetch_emails(self, filter_params: EmailFilter) -> List[ParsedEmail]:
         """Fetch emails based on filter parameters."""
         if not self._connection:
@@ -252,38 +447,101 @@ class EmailClient:
         if not header_value:
             return ""
         
+        # Do not convert Header objects to string directly as it causes Mojibake
+        # if isinstance(header_value, Header):
+        #     try:
+        #         return str(header_value)
+        #     except Exception:
+        #         pass
+
         try:
             decoded_parts = decode_header(header_value)
             decoded_string = ""
             
             for part, encoding in decoded_parts:
                 if isinstance(part, bytes):
-                    if encoding:
-                        decoded_string += part.decode(encoding)
+                    if encoding and encoding != 'unknown-8bit':
+                        try:
+                            decoded_string += part.decode(encoding)
+                        except (LookupError, UnicodeDecodeError):
+                            # Fallback for unknown encodings or errors
+                            try:
+                                decoded_string += part.decode('gb18030')
+                            except UnicodeDecodeError:
+                                try:
+                                    decoded_string += part.decode('utf-8', errors='replace')
+                                except Exception:
+                                     decoded_string += part.decode('latin-1', errors='replace')
                     else:
-                        decoded_string += part.decode('utf-8', errors='ignore')
+                        # No encoding specified or unknown-8bit. Try UTF-8, then GB18030
+                        try:
+                            decoded_string += part.decode('utf-8')
+                        except UnicodeDecodeError:
+                            try:
+                                decoded_string += part.decode('gb18030')
+                            except UnicodeDecodeError:
+                                decoded_string += part.decode('latin-1', errors='replace')
                 else:
-                    decoded_string += part
+                    # Part is already a string (str)
+                    # Check for Mojibake (Latin-1 decoded raw bytes)
+                    # This happens when headers are raw bytes (e.g. GBK) but parsed as Latin-1
+                    try:
+                        # Try to encode back to latin-1 (bytes)
+                        raw_bytes = part.encode('latin-1')
+                        
+                        # Try to decode as UTF-8 or GB18030
+                        # Heuristic: If it decodes as UTF-8 and differs, use it.
+                        # If it decodes as GB18030 and differs, use it.
+                        try:
+                            fixed = raw_bytes.decode('utf-8')
+                            if fixed != part:
+                                logger.debug(f"Fixed Mojibake (UTF-8): {part} -> {fixed}")
+                            decoded_string += fixed
+                        except UnicodeDecodeError:
+                            try:
+                                fixed = raw_bytes.decode('gb18030')
+                                if fixed != part:
+                                    logger.debug(f"Fixed Mojibake (GB18030): {part} -> {fixed}")
+                                decoded_string += fixed
+                            except UnicodeDecodeError:
+                                decoded_string += str(part)
+                    except UnicodeEncodeError:
+                        # If it contains chars > 255, it's not Latin-1 Mojibake
+                        decoded_string += str(part)
             
             return decoded_string.strip()
         except Exception as e:
-            logger.warning(f"Failed to decode header '{header_value}': {e}")
-            return header_value
+            logger.warning(f"Failed to decode header: {e}")
+            # If it's a Header object, try to convert to string as fallback
+            if isinstance(header_value, Header):
+                return str(header_value)
+            return str(header_value)
     
     def _parse_addresses(self, address_string: str) -> List[str]:
         """Parse email addresses from string."""
         if not address_string:
             return []
         
-        # Decode the address string first
-        decoded_addresses = self._decode_header(address_string)
-        
-        addresses = []
-        for addr in decoded_addresses.split(','):
-            addr = addr.strip()
-            if addr:
-                addresses.append(addr)
-        return addresses
+        try:
+            from email.utils import getaddresses
+            # Parse the addresses
+            addresses = getaddresses([address_string])
+            result = []
+            for name, addr in addresses:
+                # Decode the name part
+                decoded_name = self._decode_header(name)
+                if decoded_name:
+                    # If name exists, format as "Name" <addr>
+                    # Quote name if it contains special chars? 
+                    # For display, simple quoting is fine.
+                    result.append(f'"{decoded_name}" <{addr}>')
+                else:
+                    result.append(addr)
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to parse addresses: {e}")
+            # Fallback
+            return [addr.strip() for addr in address_string.split(',') if addr.strip()]
     
     def _extract_content(self, email_message: EmailMessage) -> str:
         """Extract and convert email content to markdown format."""
